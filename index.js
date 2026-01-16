@@ -1,17 +1,24 @@
 require('dotenv').config();
 const WebSocket = require('ws');
 const axios = require('axios');
+const { Client, GatewayIntentBits } = require('discord.js');
 
 const APP_KEY = 'kuvw5kc9qdwndhhhczoz';
-const API_TOKEN = process.env.BOT_TOKEN; // required for auth and /@me endpoint
+const BOT_TOKEN = process.env.BOT_TOKEN; // Ignite Bot Token required for auth and /@me endpoint
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN; // Discord Bot Token
 const AUTH_ENDPOINT = 'https://api.ignite-chat.com/v1/broadcasting/auth';
 const ME_ENDPOINT = 'https://api.ignite-chat.com/v1/@me';
 
-if (!API_TOKEN) throw new Error('BOT_TOKEN env variable is required');
+if (!BOT_TOKEN) throw new Error('BOT_TOKEN env variable is required');
+if (!DISCORD_BOT_TOKEN) throw new Error('DISCORD_BOT_TOKEN env variable is required');
 
 let BOT_ID = null;
 let socketId = null;
 let ws = null;
+let discordClient = null;
+
+// An map of bridged channels between Ignite and Discord
+const bridgedChannels = new Map();
 
 /**
  * Fetch bot info from Ignite API
@@ -20,7 +27,7 @@ async function fetchBotId() {
   try {
     const response = await axios.get(ME_ENDPOINT, {
       headers: {
-        'Authorization': `Bearer ${API_TOKEN}`,
+        'Authorization': `Bearer ${BOT_TOKEN}`,
         'Content-Type': 'application/json',
       },
     });
@@ -65,7 +72,7 @@ async function subscribeToChannel(channelName) {
       {
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${API_TOKEN}`,
+          'Authorization': `Bearer ${BOT_TOKEN}`,
         },
       }
     );
@@ -156,6 +163,103 @@ async function main() {
       const eventData = JSON.parse(message.data);
       const msg = eventData.message;
       console.log(`📝 New message from ${msg.author.name}: ${msg.content}`);
+
+      // Ignore messages from bots (including itself)
+      if (msg.user.is_bot) {
+        console.log('🤖 Ignoring bot message')
+        return;
+      }
+
+      // If the message is "!ping", reply with "pong"
+      if (msg.content.toLowerCase() === '!ping') {
+        try {
+          await axios.post(
+            `https://api.ignite-chat.com/v1/channels/${msg.channel_id}/messages`,
+            {
+              content: 'pong',
+            },
+            {
+              headers: {
+                'Authorization': `Bearer ${BOT_TOKEN}`,
+                'Content-Type': 'application/json',
+              },
+            }
+          );
+          console.log('↩️ Replied with pong');
+        } catch (err) {
+          console.error('🔥 Failed to send reply:', err);
+        }
+      }
+
+      // If the message is "!bridge", take the first argument as a channel id to bridge
+      else if (msg.content.toLowerCase().startsWith('!bridge')) {
+        const parts = msg.content.split(' ');
+        if (parts.length >= 2) {
+          const targetChannelId = parts[1];
+
+          console.log(`🌉 Bridging to channel ID: ${targetChannelId}`);
+
+          // Check if this channel ID exists in Discord
+          discordClient.channels.fetch(targetChannelId).then(channel => {
+            if (!channel) {
+              console.log(`❌ Discord Channel ID ${targetChannelId} not found`);
+              return;
+            }
+            
+            // Make sure the channel is a text channel
+            if (channel.type !== 0) { // 0 is GuildText
+              console.log(`❌ Discord Channel ID ${targetChannelId} is not a text channel`);
+              return;
+            }
+
+            bridgedChannels.set(targetChannelId, msg.channel_id);
+            bridgedChannels.set(msg.channel_id, targetChannelId);
+            console.log(`✅ Successfully bridged Ignite Channel ID ${msg.channel_id} with Discord Channel ID ${targetChannelId} ${channel.name}`);
+
+            axios.post(
+              `https://api.ignite-chat.com/v1/channels/${msg.channel_id}/messages`,
+              {
+                content: 'This Ignite channel is now bridged with Discord channel #' + channel.name,
+              },
+              {
+                headers: {
+                  'Authorization': `Bearer ${BOT_TOKEN}`,
+                  'Content-Type': 'application/json',
+                },
+              }
+            ).catch(err => {
+              console.error('🔥 Failed to send bridge confirmation message:', err);
+            });
+
+            // Send a message to the Discord channel confirming the bridge
+            channel.send(`This Discord channel is now bridged with Ignite channel ID ${msg.channel_id}`).catch(err => {
+              console.error('🔥 Failed to send bridge confirmation message to Discord:', err);
+            });
+          }).catch(err => {
+            console.error('🔥 Error fetching Discord channel:', err);
+          });
+        } else {
+          console.log('⚠️ !bridge command requires a channel ID argument');
+        }
+      }
+
+      else if (bridgedChannels.has(msg.channel_id)) {
+        const discordChannelId = bridgedChannels.get(msg.channel_id);
+
+        // Forward the message to Discord
+        discordClient.channels.fetch(discordChannelId).then(channel => {
+          if (!channel) {
+            console.log(`❌ Discord Channel ID ${discordChannelId} not found for forwarding`);
+            return;
+          }
+
+          channel.send(`💬 [Ignite] ${msg.author.name}: ${msg.content}`).catch(err => {
+            console.error('🔥 Failed to forward message to Discord:', err);
+          });
+        }).catch(err => {
+          console.error('🔥 Error fetching Discord channel for forwarding:', err);
+        });
+      }
     }
   });
 
@@ -163,4 +267,43 @@ async function main() {
   ws.on('error', (err) => console.error('🔥 WebSocket error:', err));
 }
 
+
+/**
+ * Start Discord Bot
+ */
+function startDiscordBot() {
+  discordClient = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+
+  discordClient.once('ready', () => console.log(`🤖 Discord Bot Logged in as ${discordClient.user.tag}`));
+
+  discordClient.on('messageCreate', (message) => {
+    if (message.author.bot) return; // Ignore bot messages
+    
+    // If this channel is bridged, forward the message to Ignite Chat
+    if (bridgedChannels.has(message.channel.id)) {
+      const igniteChannelId = bridgedChannels.get(message.channel.id);
+
+      axios.post(
+        `https://api.ignite-chat.com/v1/channels/${igniteChannelId}/messages`,
+        {
+          content: `[Discord] ${message.author.username}: ${message.content}`,
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${BOT_TOKEN}`,
+            'Content-Type': 'application/json',
+          },
+        }
+      ).then(() => {
+        console.log(`➡️ Forwarded message to Ignite Channel ID: ${igniteChannelId}`);
+      }).catch(err => {
+        console.error('🔥 Failed to forward message to Ignite:', err);
+      });
+    }
+  });
+
+  discordClient.login(DISCORD_BOT_TOKEN).catch(err => console.error('🔥 Discord login error:', err));
+}
+
+startDiscordBot();
 main();
