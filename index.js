@@ -20,12 +20,14 @@ let discordClient = null;
 // A map of bridged channels between Ignite and Discord
 const bridgedChannels = new Map();
 
-
 // A map of Ignite Channel ID -> Ignite Webhook URL
 const igniteWebhooks = new Map();
 
 // A map of Discord Channel ID -> Discord Webhook URL
 const discordWebhooks = new Map();
+
+// A map of bridged messages between Ignite and Discord
+const messageMap = new Map();
 
 /**
  * Fetch bot info from Ignite API
@@ -239,9 +241,9 @@ async function main() {
             });
 
             // Send a message to the Discord channel confirming the bridge
-            channel.send(`This Discord channel is now bridged with Ignite channel ID ${msg.channel_id}`).catch(err => {
-              console.error('🔥 Failed to send bridge confirmation message to Discord:', err);
-            });
+            // channel.send(`This Discord channel is now bridged with Ignite channel ID ${msg.channel_id}`).catch(err => {
+            //   console.error('🔥 Failed to send bridge confirmation message to Discord:', err);
+            // });
           }).catch(err => {
             console.error('🔥 Error fetching Discord channel:', err);
           });
@@ -249,6 +251,48 @@ async function main() {
           console.log('⚠️ !bridge command requires a channel ID argument');
         }
       }
+      /**
+       * Allow Ignite Chat users to kick discord users by typing !kick <Discord User ID>
+       */
+      else if (msg.content.toLowerCase().startsWith('!kick')) {
+        const parts = msg.content.split(' ');
+        if (parts.length >= 2) {
+          const targetUserId = parts[1];
+          console.log(`🚫 Kicking Discord User ID: ${targetUserId}`)
+          discordClient.users.fetch(targetUserId).then(user => {
+            if (!user) {
+              console.log(`❌ Discord User ID ${targetUserId} not found`);
+              return;
+            }
+
+            // Get the guild from the message
+            const guild = msg.guild;
+            if (!guild) {
+              console.log('❌ Message not sent in a guild');
+              return;
+            }
+
+            guild.members.fetch(user.id).then(member => {
+              if (!member) {
+                console.log(`❌ Member with ID ${targetUserId} not found in guild`);
+                return;
+              }
+              member.kick('Kicked by command').then(() => {
+                console.log(`✅ Kicked user ${targetUserId}`);
+              }).catch(err => {
+                console.error('🔥 Error kicking member:', err);
+              });
+            }).catch(err => {
+              console.error('🔥 Error fetching member:', err);
+            });
+          }).catch(err => {
+            console.error('🔥 Error fetching Discord user:', err)
+          });
+        } else {
+          console.log('⚠️ !ban command requires a user ID argument');
+        }
+      }
+
 
       if (bridgedChannels.has(msg.channel_id)) {
         const discordChannelId = bridgedChannels.get(msg.channel_id);
@@ -260,12 +304,64 @@ async function main() {
             return;
           }
 
-          channel.send(`💬 [Ignite] ${msg.author.name}: ${msg.content}`).catch(err => {
-            console.error('🔥 Failed to forward message to Discord:', err);
-          });
+          channel.send(`💬 [Ignite] ${msg.author.name}: ${msg.content}`)
+            .then((discordMsg) => {
+              console.log(`➡️ Forwarded message to Discord Channel ID: ${discordChannelId}`, discordMsg.id);
+              messageMap.set(msg.id, discordMsg.id);
+              messageMap.set(discordMsg.id, msg.id);
+            })
+            .catch(err => {
+              console.error('🔥 Failed to forward message to Discord:', err);
+            });
         }).catch(err => {
           console.error('🔥 Error fetching Discord channel for forwarding:', err);
         });
+      }
+    }
+
+
+    /**
+     * Handle message deletions in Ignite Chat, delete corresponding message in Discord
+     */
+    if (message.event == 'message.deleted') {
+      const eventData = JSON.parse(message.data);
+      const msg = eventData.message;
+      console.log(`🗑️ Message deleted: ${msg.id}`);
+
+      // If this message was bridged, delete the corresponding message in Discord
+      if (messageMap.has(msg.id)) {
+        const discordMsgId = messageMap.get(msg.id);
+
+        console.log(`🌉 Deleting bridged Discord message ID: ${discordMsgId}`);
+
+        // Find the Discord channel that contains this message
+        for (const [discordChannelId, igniteChannelId] of bridgedChannels.entries()) {
+          if (igniteChannelId === msg.channel_id) {
+            discordClient.channels.fetch(discordChannelId).then(channel => {
+              if (!channel) {
+                console.log(`❌ Discord Channel ID ${discordChannelId} not found for deletion`);
+                return;
+              }
+
+              channel.messages.fetch(discordMsgId).then(discordMsg => {
+                if (!discordMsg) {
+                  console.log(`❌ Discord Message ID ${discordMsgId} not found for deletion`);
+                  return;
+                }
+
+                discordMsg.delete().then(() => {
+                  console.log(`🗑️ Deleted bridged Discord message ID: ${discordMsgId}`);
+                }).catch(err => {
+                  console.error('🔥 Failed to delete Discord message:', err);
+                });
+              }).catch(err => {
+                console.error('🔥 Error fetching Discord message for deletion:', err);
+              });
+            }).catch(err => {
+              console.error('🔥 Error fetching Discord channel for deletion:', err);
+            });
+          }
+        }
       }
     }
 
@@ -385,6 +481,9 @@ function startDiscordBot() {
 
   discordClient.once('ready', () => console.log(`🤖 Discord Bot Logged in as ${discordClient.user.tag}`));
 
+  /**
+   * Handle new messages in Discord, forward them to Ignite Chat if the channel is bridged
+   */
   discordClient.on('messageCreate', (message) => {
     if (message.author.bot) return; // Ignore bot messages
 
@@ -403,13 +502,49 @@ function startDiscordBot() {
             'Content-Type': 'application/json',
           },
         }
-      ).then(() => {
-        console.log(`➡️ Forwarded message to Ignite Channel ID: ${igniteChannelId}`);
+      ).then((forwardedMessage) => {
+        console.log(`➡️ Forwarded message to Ignite Channel ID: ${igniteChannelId}`, forwardedMessage.data.id, message.id);
+        messageMap.set(message.id, forwardedMessage.data.id);
+        messageMap.set(forwardedMessage.data.id, message.id);
       }).catch(err => {
         console.error('🔥 Failed to forward message to Ignite:', err);
       });
     }
   });
+
+  /**
+   * Handle message deletions in Discord
+   */
+  // discordClient.on('messageDelete', (message) => {
+  //   if (message.author.bot) return;
+
+  //   // If this channel is bridged, delete the corresponding message in Ignite Chat
+  //   if (bridgedChannels.has(message.channel.id)) {
+  //     const igniteChannelId = bridgedChannels.get(message.channel.id);
+
+  //     // Check if we have a mapped message ID
+  //     if (messageMap.has(message.id)) {
+  //       const igniteMsgId = messageMap.get(message.id);
+
+  //       console.log(`🌉 Deleting bridged Ignite message ID: ${igniteMsgId}`);
+
+  //       axios.delete(
+  //         `https://api.ignite-chat.com/v1/channels/${igniteChannelId}/messages/${igniteMsgId}`,
+  //         {
+  //           headers: {
+  //             'Authorization': `Bearer ${BOT_TOKEN}`,
+  //             'Content-Type': 'application/json',
+  //           },
+  //         }
+  //       ).then(() => {
+  //         console.log(`🗑️ Deleted bridged Ignite message ID: ${igniteMsgId}`);
+  //       }).catch(err => {
+  //         console.error('🔥 Failed to delete Ignite message:', err);
+  //       });
+  //     }
+  //   }
+  // });
+
 
   discordClient.login(DISCORD_BOT_TOKEN).catch(err => console.error('🔥 Discord login error:', err));
 }
