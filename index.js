@@ -4,7 +4,7 @@ const axios = require('axios');
 const { Client, GatewayIntentBits } = require('discord.js');
 
 const APP_KEY = 'kuvw5kc9qdwndhhhczoz';
-const BOT_TOKEN = process.env.BOT_TOKEN; // Ignite Bot Token required for auth and /@me endpoint
+const BOT_TOKEN = process.env.IGNITE_BOT_TOKEN; // Ignite Bot Token required for auth and /@me endpoint
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN; // Discord Bot Token
 const AUTH_ENDPOINT = 'https://api.ignite-chat.com/v1/broadcasting/auth';
 const ME_ENDPOINT = 'https://api.ignite-chat.com/v1/@me';
@@ -17,8 +17,15 @@ let socketId = null;
 let ws = null;
 let discordClient = null;
 
-// An map of bridged channels between Ignite and Discord
+// A map of bridged channels between Ignite and Discord
 const bridgedChannels = new Map();
+
+
+// A map of Ignite Channel ID -> Ignite Webhook URL
+const igniteWebhooks = new Map();
+
+// A map of Discord Channel ID -> Discord Webhook URL
+const discordWebhooks = new Map();
 
 /**
  * Fetch bot info from Ignite API
@@ -165,7 +172,7 @@ async function main() {
       console.log(`📝 New message from ${msg.author.name}: ${msg.content}`);
 
       // Ignore messages from bots (including itself)
-      if (msg.user.is_bot) {
+      if (msg.author.is_bot) {
         console.log('🤖 Ignoring bot message')
         return;
       }
@@ -205,7 +212,7 @@ async function main() {
               console.log(`❌ Discord Channel ID ${targetChannelId} not found`);
               return;
             }
-            
+
             // Make sure the channel is a text channel
             if (channel.type !== 0) { // 0 is GuildText
               console.log(`❌ Discord Channel ID ${targetChannelId} is not a text channel`);
@@ -243,7 +250,7 @@ async function main() {
         }
       }
 
-      else if (bridgedChannels.has(msg.channel_id)) {
+      if (bridgedChannels.has(msg.channel_id)) {
         const discordChannelId = bridgedChannels.get(msg.channel_id);
 
         // Forward the message to Discord
@@ -260,6 +267,108 @@ async function main() {
           console.error('🔥 Error fetching Discord channel for forwarding:', err);
         });
       }
+    }
+
+    //   {
+    //     "user":{
+    //        "id":"1360277753638682624",
+    //        "name":null,
+    //        "avatar_url":null,
+    //        "username":"testbot2",
+    //        "is_bot":true,
+    //        "is_guest":true
+    //     },
+    //     "guild":{
+    //        "id":"1359587558387875840",
+    //        "name":"Test3",
+    //        "description":null,
+    //        "icon_url":null,
+    //        "vanity":null,
+    //        "owner_id":"1359586804725972992",
+    //        "created_at":"2026-01-16T17:55:33.000000Z",
+    //        "channels":[
+    //           {
+    //              "channel_id":"1359587558404653056",
+    //              "guild_id":"1359587558387875840",
+    //              "name":"general",
+    //              "position":0,
+    //              "parent_id":"1359587558396264448",
+    //              "created_at":"2026-01-16T17:55:33.000000Z",
+    //              "type":0,
+    //              "role_permissions":[
+
+    //              ]
+    //           },
+    //           {
+    //              "channel_id":"1359647854901067776",
+    //              "guild_id":"1359587558387875840",
+    //              "name":"Test Channel",
+    //              "position":0,
+    //              "parent_id":null,
+    //              "created_at":"2026-01-16T21:55:09.000000Z",
+    //              "type":0,
+    //              "role_permissions":[
+
+    //              ]
+    //           },
+    //           {
+    //              "channel_id":"1359648123089059840",
+    //              "guild_id":"1359587558387875840",
+    //              "name":"Test",
+    //              "position":0,
+    //              "parent_id":"1359588709237784576",
+    //              "created_at":"2026-01-16T21:56:13.000000Z",
+    //              "type":0,
+    //              "role_permissions":[
+
+    //              ]
+    //           },
+    //           {
+    //              "channel_id":"1359587558396264448",
+    //              "guild_id":"1359587558387875840",
+    //              "name":"Text Channels",
+    //              "position":0,
+    //              "created_at":"2026-01-16T17:55:33.000000Z",
+    //              "type":3
+    //           },
+    //           {
+    //              "channel_id":"1359588709237784576",
+    //              "guild_id":"1359587558387875840",
+    //              "name":"Test Category",
+    //              "position":0,
+    //              "created_at":"2026-01-16T18:00:08.000000Z",
+    //              "type":3
+    //           }
+    //        ],
+    //        "roles":[
+
+    //        ]
+    //     }
+    //  }
+    if (message.event == 'guild.joined') {
+      const eventData = JSON.parse(message.data);
+      const guild = eventData.guild;
+      console.log(`🎉 Joined new guild: ${guild.name} (ID: ${guild.id})`);
+
+      // Get all Text Channels in the guild and send a welcome message
+      guild.channels.filter(c => c.type === 0).forEach(channel => {
+        axios.post(
+          `https://api.ignite-chat.com/v1/channels/${channel.channel_id}/messages`,
+          {
+            content: `Hello! I'm the official Ignite Bot, Type \`!bridge <Discord Channel ID>\` to bridge this channel with a Discord channel.`,
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${BOT_TOKEN}`,
+              'Content-Type': 'application/json',
+            },
+          }
+        ).then(() => {
+          console.log(`✉️ Sent welcome message to channel ID: ${channel.channel_id}`);
+        }).catch(err => {
+          console.error('🔥 Failed to send welcome message:', err);
+        });
+      });
     }
   });
 
@@ -278,7 +387,7 @@ function startDiscordBot() {
 
   discordClient.on('messageCreate', (message) => {
     if (message.author.bot) return; // Ignore bot messages
-    
+
     // If this channel is bridged, forward the message to Ignite Chat
     if (bridgedChannels.has(message.channel.id)) {
       const igniteChannelId = bridgedChannels.get(message.channel.id);
